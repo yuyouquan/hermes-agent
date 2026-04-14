@@ -1112,6 +1112,225 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    async def _handle_list_runs(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs — list currently active run streams."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            now = time.time()
+            runs = []
+            for run_id, created_at in list(self._run_streams_created.items()):
+                runs.append({
+                    "run_id": run_id,
+                    "created_at": created_at,
+                    "age_seconds": round(now - created_at, 1),
+                    "queue_size": self._run_streams[run_id].qsize() if run_id in self._run_streams else 0,
+                })
+            runs.sort(key=lambda r: r["created_at"], reverse=True)
+            return web.json_response({
+                "runs": runs,
+                "total": len(runs),
+                "max_concurrent": self._MAX_CONCURRENT_RUNS,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] list_runs failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_list_job_runs(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/runs — list past output files for a job."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            job_id = request.match_info.get("job_id", "")
+            if not re.fullmatch(r"[a-f0-9]{12}", job_id):
+                return web.json_response({"error": "invalid job id"}, status=400)
+            out_dir = _Path.home() / ".hermes" / "cron" / "output" / job_id
+            runs = []
+            if out_dir.exists():
+                for fp in sorted(out_dir.glob("*.md"), reverse=True)[:100]:
+                    stat = fp.stat()
+                    runs.append({
+                        "timestamp": fp.stem,
+                        "path": str(fp),
+                        "size": stat.st_size,
+                        "modified_at": stat.st_mtime,
+                    })
+            return web.json_response({"job_id": job_id, "runs": runs})
+        except Exception as e:
+            logger.exception("[Api_Server] list_job_runs failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_job_run(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/runs/{timestamp} — read a specific output file."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            job_id = request.match_info.get("job_id", "")
+            timestamp = request.match_info.get("timestamp", "")
+            if not re.fullmatch(r"[a-f0-9]{12}", job_id):
+                return web.json_response({"error": "invalid job id"}, status=400)
+            if not re.fullmatch(r"[0-9_-]+", timestamp):
+                return web.json_response({"error": "invalid timestamp"}, status=400)
+            fp = _Path.home() / ".hermes" / "cron" / "output" / job_id / f"{timestamp}.md"
+            if not fp.exists():
+                return web.json_response({"error": "run output not found"}, status=404)
+            content = fp.read_text(encoding="utf-8")
+            return web.json_response({
+                "job_id": job_id,
+                "timestamp": timestamp,
+                "content": content,
+                "size": fp.stat().st_size,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] get_job_run failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_config(self, request: "web.Request") -> "web.Response":
+        """GET /api/config — return raw config.yaml with secrets masked."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            fp = _Path.home() / ".hermes" / "config.yaml"
+            if not fp.exists():
+                return web.json_response({"content": "", "path": str(fp), "exists": False})
+            content = fp.read_text(encoding="utf-8")
+            # Mask anything that looks like a secret line
+            masked_lines = []
+            SECRET_PATTERNS = (
+                "api_key", "api-key", "apikey", "secret", "token",
+                "password", "passwd", "app_secret",
+            )
+            for line in content.splitlines():
+                lower = line.lower()
+                if any(p in lower for p in SECRET_PATTERNS) and ":" in line:
+                    key, _, _ = line.partition(":")
+                    # Only mask if there's an actual non-empty value after colon
+                    value_part = line.split(":", 1)[1].strip()
+                    if value_part and not value_part.startswith("#"):
+                        masked_lines.append(f"{key}: ***MASKED***")
+                        continue
+                masked_lines.append(line)
+            return web.json_response({
+                "content": "\n".join(masked_lines),
+                "path": str(fp),
+                "exists": True,
+                "size": fp.stat().st_size,
+                "modified_at": fp.stat().st_mtime,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] get_config failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_workspace_tree(self, request: "web.Request") -> "web.Response":
+        """GET /api/workspace/tree?path=subdir — list directory contents under the workspace root."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            # Workspace root = terminal.cwd from config, or home
+            root = self._get_workspace_root()
+            sub = request.query.get("path", "").lstrip("/")
+            target = (root / sub).resolve() if sub else root.resolve()
+
+            # Sandbox: must stay inside root
+            try:
+                target.relative_to(root.resolve())
+            except ValueError:
+                return web.json_response({"error": "path escapes workspace"}, status=403)
+
+            if not target.exists():
+                return web.json_response({"error": "path not found"}, status=404)
+            if not target.is_dir():
+                return web.json_response({"error": "path is not a directory"}, status=400)
+
+            SKIP = {".git", "node_modules", ".next", "__pycache__", ".venv", "venv", ".DS_Store"}
+            entries = []
+            for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                if item.name.startswith(".") and item.name not in (".env",):
+                    continue
+                if item.name in SKIP:
+                    continue
+                try:
+                    stat = item.stat()
+                except OSError:
+                    continue
+                entries.append({
+                    "name": item.name,
+                    "is_dir": item.is_dir(),
+                    "size": stat.st_size if item.is_file() else 0,
+                    "modified_at": stat.st_mtime,
+                })
+            rel = str(target.relative_to(root.resolve())) if target != root.resolve() else ""
+            return web.json_response({
+                "root": str(root),
+                "path": rel,
+                "entries": entries,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] get_workspace_tree failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_workspace_file(self, request: "web.Request") -> "web.Response":
+        """GET /api/workspace/file?path=foo/bar.ts — read a single file."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            root = self._get_workspace_root()
+            sub = request.query.get("path", "").lstrip("/")
+            if not sub:
+                return web.json_response({"error": "path required"}, status=400)
+            target = (root / sub).resolve()
+            try:
+                target.relative_to(root.resolve())
+            except ValueError:
+                return web.json_response({"error": "path escapes workspace"}, status=403)
+            if not target.exists() or not target.is_file():
+                return web.json_response({"error": "file not found"}, status=404)
+            # Cap at 1 MB
+            size = target.stat().st_size
+            if size > 1_000_000:
+                return web.json_response({"error": "file too large", "size": size}, status=413)
+            try:
+                content = target.read_text(encoding="utf-8")
+                binary = False
+            except UnicodeDecodeError:
+                content = "(binary file — preview unavailable)"
+                binary = True
+            return web.json_response({
+                "path": sub,
+                "content": content,
+                "size": size,
+                "binary": binary,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] get_workspace_file failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    def _get_workspace_root(self) -> "Path":
+        """Resolve the workspace root from terminal.cwd config, fallback to HOME."""
+        from pathlib import Path as _Path
+        try:
+            from gateway.run import _load_gateway_config  # type: ignore
+            cfg = _load_gateway_config()
+            cwd = (cfg.get("terminal") or {}).get("cwd")
+            if cwd and cwd != ".":
+                p = _Path(cwd).expanduser().resolve()
+                if p.exists() and p.is_dir():
+                    return p
+        except Exception:
+            pass
+        return _Path.home()
+
     async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
         """GET /api/memory — list memory files (MEMORY.md / USER.md) with content."""
         auth_err = self._check_auth(request)
@@ -2009,8 +2228,15 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
             # Structured event streaming
+            self._app.router.add_get("/v1/runs", self._handle_list_runs)
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            # Job run history + config + workspace
+            self._app.router.add_get("/api/jobs/{job_id}/runs", self._handle_list_job_runs)
+            self._app.router.add_get("/api/jobs/{job_id}/runs/{timestamp}", self._handle_get_job_run)
+            self._app.router.add_get("/api/config", self._handle_get_config)
+            self._app.router.add_get("/api/workspace/tree", self._handle_get_workspace_tree)
+            self._app.router.add_get("/api/workspace/file", self._handle_get_workspace_file)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
