@@ -1112,6 +1112,74 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions — list sessions, optionally filtered by source/platform.
+
+        Query params:
+          source: filter by platform (cli, api_server, feishu, telegram, etc.)
+          limit: max rows (default 50, capped at 500)
+          offset: pagination offset (default 0)
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response({"error": "SessionDB unavailable"}, status=503)
+
+            source = request.query.get("source") or None
+            try:
+                limit = int(request.query.get("limit", "50"))
+            except ValueError:
+                limit = 50
+            limit = max(1, min(limit, 500))
+            try:
+                offset = int(request.query.get("offset", "0"))
+            except ValueError:
+                offset = 0
+            offset = max(0, offset)
+
+            sessions = db.search_sessions(source=source, limit=limit, offset=offset)
+            total = db.session_count(source=source)
+            return web.json_response({
+                "sessions": sessions,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] list_sessions failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/messages — full message history for a session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response({"error": "SessionDB unavailable"}, status=503)
+
+            session_id = request.match_info.get("session_id", "")
+            if not session_id:
+                return web.json_response({"error": "session_id required"}, status=400)
+
+            resolved = db.resolve_session_id(session_id) or session_id
+            session = db.get_session(resolved)
+            if session is None:
+                return web.json_response({"error": "session not found"}, status=404)
+
+            messages = db.get_messages(resolved)
+            return web.json_response({
+                "session": session,
+                "messages": messages,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] get_session_messages failed")
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -1692,6 +1760,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Sessions / message history API
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_session_messages)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
