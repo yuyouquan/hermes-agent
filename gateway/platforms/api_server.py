@@ -1112,6 +1112,82 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    async def _handle_get_credentials(self, request: "web.Request") -> "web.Response":
+        """GET /api/credentials — list .env credential keys with values masked."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            env_path = _Path.home() / ".hermes" / ".env"
+            if not env_path.exists():
+                return web.json_response({"entries": [], "path": str(env_path), "exists": False})
+
+            GROUPS = {
+                "anthropic": ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+                "openai": ["OPENAI_API_KEY"],
+                "openrouter": ["OPENROUTER_API_KEY"],
+                "gemini": ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+                "nous": ["NOUS_API_KEY"],
+                "mistral": ["MISTRAL_API_KEY"],
+                "zai": ["GLM_API_KEY"],
+                "kimi": ["KIMI_API_KEY", "MOONSHOT_API_KEY"],
+                "minimax": ["MINIMAX_API_KEY", "MINIMAX_CN_API_KEY"],
+                "huggingface": ["HF_TOKEN"],
+                "github": ["GITHUB_TOKEN"],
+                "telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_HOME_CHANNEL"],
+                "discord": ["DISCORD_TOKEN", "DISCORD_HOME_CHANNEL"],
+                "slack": ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"],
+                "feishu": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
+                "browserbase": ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+                "exa": ["EXA_API_KEY"],
+                "firecrawl": ["FIRECRAWL_API_KEY"],
+                "elevenlabs": ["ELEVENLABS_API_KEY"],
+                "fal": ["FAL_KEY"],
+                "api_server": ["API_SERVER_KEY", "API_SERVER_CORS_ORIGINS", "API_SERVER_ENABLED"],
+                "gateway": ["GATEWAY_ALLOW_ALL_USERS"],
+            }
+            key_to_group = {}
+            for group, keys in GROUPS.items():
+                for k in keys:
+                    key_to_group[k] = group
+
+            def mask(value: str) -> str:
+                if not value:
+                    return ""
+                if len(value) <= 8:
+                    return "*" * len(value)
+                return f"{value[:4]}…{value[-4:]}"
+
+            entries = []
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.rstrip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, raw_value = line.partition("=")
+                key = key.strip()
+                value = raw_value.strip().strip('"').strip("'")
+                if not key.isidentifier():
+                    continue
+                entries.append({
+                    "key": key,
+                    "group": key_to_group.get(key, "other"),
+                    "set": bool(value),
+                    "masked": mask(value) if value else "",
+                })
+            entries.sort(key=lambda e: (e["group"], e["key"]))
+            return web.json_response({
+                "entries": entries,
+                "path": str(env_path),
+                "exists": True,
+                "total": len(entries),
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] get_credentials failed")
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_list_runs(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs — list currently active run streams."""
         auth_err = self._check_auth(request)
@@ -2235,6 +2311,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/jobs/{job_id}/runs", self._handle_list_job_runs)
             self._app.router.add_get("/api/jobs/{job_id}/runs/{timestamp}", self._handle_get_job_run)
             self._app.router.add_get("/api/config", self._handle_get_config)
+            self._app.router.add_get("/api/credentials", self._handle_get_credentials)
             self._app.router.add_get("/api/workspace/tree", self._handle_get_workspace_tree)
             self._app.router.add_get("/api/workspace/file", self._handle_get_workspace_file)
             # Start background sweep to clean up orphaned (unconsumed) run streams
