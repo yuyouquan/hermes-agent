@@ -1112,6 +1112,232 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
+        """GET /api/memory — list memory files (MEMORY.md / USER.md) with content."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            base = _Path.home() / ".hermes" / "memories"
+            files = []
+            if base.exists():
+                for name in ("MEMORY.md", "USER.md"):
+                    fp = base / name
+                    if fp.exists():
+                        try:
+                            content = fp.read_text(encoding="utf-8")
+                            stat = fp.stat()
+                            files.append({
+                                "name": name,
+                                "path": str(fp),
+                                "content": content,
+                                "size": stat.st_size,
+                                "modified_at": stat.st_mtime,
+                            })
+                        except Exception as e:
+                            files.append({"name": name, "error": str(e)})
+            return web.json_response({"files": files})
+        except Exception as e:
+            logger.exception("[Api_Server] get_memory failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_update_memory(self, request: "web.Request") -> "web.Response":
+        """PUT /api/memory/{name} — update a memory file (MEMORY.md or USER.md)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            name = request.match_info.get("name", "")
+            if name not in ("MEMORY.md", "USER.md"):
+                return web.json_response({"error": "invalid memory file"}, status=400)
+            body = await request.json()
+            content = body.get("content", "")
+            if not isinstance(content, str):
+                return web.json_response({"error": "content must be string"}, status=400)
+            base = _Path.home() / ".hermes" / "memories"
+            base.mkdir(parents=True, exist_ok=True)
+            fp = base / name
+            fp.write_text(content, encoding="utf-8")
+            return web.json_response({"name": name, "size": len(content)})
+        except Exception as e:
+            logger.exception("[Api_Server] update_memory failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills — list all installed skills with frontmatter metadata."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            base = _Path.home() / ".hermes" / "skills"
+            skills = []
+            if base.exists():
+                for skill_md in sorted(base.glob("**/SKILL.md")):
+                    try:
+                        text = skill_md.read_text(encoding="utf-8")
+                        meta = {}
+                        if text.startswith("---"):
+                            end = text.find("\n---", 3)
+                            if end > 0:
+                                fm = text[3:end].strip()
+                                for line in fm.splitlines():
+                                    if ":" in line and not line.startswith(" "):
+                                        k, _, v = line.partition(":")
+                                        meta[k.strip()] = v.strip().strip('"')
+                        rel = skill_md.relative_to(base).parent
+                        skills.append({
+                            "id": str(rel),
+                            "name": meta.get("name", str(rel)),
+                            "description": meta.get("description", ""),
+                            "version": meta.get("version", ""),
+                            "author": meta.get("author", ""),
+                            "path": str(skill_md),
+                            "category": str(rel).split("/")[0] if "/" in str(rel) else "",
+                        })
+                    except Exception:
+                        pass
+            return web.json_response({"skills": skills, "total": len(skills)})
+        except Exception as e:
+            logger.exception("[Api_Server] list_skills failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_skill(self, request: "web.Request") -> "web.Response":
+        """GET /api/skills/{id} — get full skill content."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            skill_id = request.match_info.get("id", "")
+            # Protect against directory traversal
+            if ".." in skill_id or skill_id.startswith("/"):
+                return web.json_response({"error": "invalid skill id"}, status=400)
+            fp = _Path.home() / ".hermes" / "skills" / skill_id / "SKILL.md"
+            if not fp.exists():
+                return web.json_response({"error": "skill not found"}, status=404)
+            content = fp.read_text(encoding="utf-8")
+            return web.json_response({"id": skill_id, "content": content})
+        except Exception as e:
+            logger.exception("[Api_Server] get_skill failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_tail_logs(self, request: "web.Request") -> "web.Response":
+        """GET /api/logs/tail?file=gateway&lines=200 — return last N lines of a log file."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from pathlib import Path as _Path
+            LOG_FILES = {
+                "gateway": "gateway.log",
+                "gateway_error": "gateway.error.log",
+                "agent": "agent.log",
+                "errors": "errors.log",
+            }
+            name = request.query.get("file", "gateway")
+            if name not in LOG_FILES:
+                return web.json_response({"error": "unknown log file"}, status=400)
+            try:
+                lines_arg = int(request.query.get("lines", "200"))
+            except ValueError:
+                lines_arg = 200
+            lines_arg = max(1, min(lines_arg, 5000))
+
+            fp = _Path.home() / ".hermes" / "logs" / LOG_FILES[name]
+            if not fp.exists():
+                return web.json_response({"file": name, "lines": []})
+
+            # Read last N lines efficiently
+            with open(fp, "rb") as f:
+                f.seek(0, 2)
+                file_size = f.tell()
+                block_size = 4096
+                data = b""
+                while len(data.splitlines()) <= lines_arg and f.tell() > 0:
+                    seek_back = min(block_size, f.tell())
+                    f.seek(-seek_back, 1)
+                    data = f.read(seek_back) + data
+                    f.seek(-seek_back, 1)
+                    if f.tell() == 0:
+                        break
+            text = data.decode("utf-8", errors="replace")
+            all_lines = text.splitlines()[-lines_arg:]
+            return web.json_response({
+                "file": name,
+                "path": str(fp),
+                "lines": all_lines,
+                "size": file_size,
+            })
+        except Exception as e:
+            logger.exception("[Api_Server] tail_logs failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_gateway_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/gateway/status — list configured platforms and their connection state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            # The gateway Runner instance holds adapter state; we can reach it via the app key.
+            platforms: list[dict] = []
+            try:
+                from gateway.run import _RUNNER_SINGLETON  # type: ignore
+            except Exception:
+                _RUNNER_SINGLETON = None  # type: ignore
+
+            runner = _RUNNER_SINGLETON
+            if runner is not None and hasattr(runner, "adapters"):
+                for platform, adapter in runner.adapters.items():
+                    name = getattr(platform, "value", str(platform))
+                    connected = False
+                    try:
+                        connected = bool(getattr(adapter, "is_connected", False))
+                    except Exception:
+                        pass
+                    platforms.append({
+                        "platform": name,
+                        "connected": connected,
+                        "class": type(adapter).__name__,
+                    })
+            else:
+                platforms.append({
+                    "platform": "api_server",
+                    "connected": True,
+                    "class": "APIServerAdapter",
+                })
+            return web.json_response({"platforms": platforms})
+        except Exception as e:
+            logger.exception("[Api_Server] gateway_status failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/search?q=hello — full-text search across all message content."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response({"error": "SessionDB unavailable"}, status=503)
+
+            query = (request.query.get("q") or "").strip()
+            if not query:
+                return web.json_response({"results": [], "total": 0})
+            try:
+                limit = int(request.query.get("limit", "50"))
+            except ValueError:
+                limit = 50
+            limit = max(1, min(limit, 200))
+
+            results = db.search_messages(query=query, limit=limit, offset=0)
+            return web.json_response({"results": results, "total": len(results)})
+        except Exception as e:
+            logger.exception("[Api_Server] search_sessions failed")
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list sessions, optionally filtered by source/platform.
 
@@ -1762,7 +1988,17 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Sessions / message history API
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_session_messages)
+            # Memory editor
+            self._app.router.add_get("/api/memory", self._handle_get_memory)
+            self._app.router.add_put("/api/memory/{name}", self._handle_update_memory)
+            # Skills browser
+            self._app.router.add_get("/api/skills", self._handle_list_skills)
+            self._app.router.add_get("/api/skills/{id:.*}", self._handle_get_skill)
+            # Logs and gateway status
+            self._app.router.add_get("/api/logs/tail", self._handle_tail_logs)
+            self._app.router.add_get("/api/gateway/status", self._handle_gateway_status)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

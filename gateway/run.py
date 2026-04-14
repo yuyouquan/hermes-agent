@@ -475,6 +475,9 @@ class GatewayRunner:
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Expose this runner at module level so the API server adapter
+        # can enumerate sibling platforms for /api/gateway/status.
+        globals()["_RUNNER_SINGLETON"] = self
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
